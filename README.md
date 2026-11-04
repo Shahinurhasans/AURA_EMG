@@ -84,6 +84,8 @@ PiEEG. Aura: Calibration-Free EMG Challenge. https://www.kaggle.com/competitions
 
 DATA:
 
+dataset is "https://drive.google.com/drive/folders/1npdZNRViqNlGl-KBGGJc1Od2zpyoQTCf" for your understanding.
+
 Dataset Description
 Dataset Description
 Dataset version 2 (updated 29 Oct 2026)

@@ -25,6 +25,10 @@
 #   cnn_ea              CNN on Euclidean-aligned EMG    He & Wu 2020
 #   cnn_rotaug          CNN + barrel-shift (electrode rotation) augmentation
 #                                                        Chamberland et al. 2023
+#   auranet_like        the organisers' AuraNet design: temporal-spatial CNN
+#                       (EEGNet-style, Lawhern et al. 2018) on the 8 EMG channels
+#   auranet_like_adabn  same model + AdaBN per person
+#   auranet_like_ea     same model on Euclidean-aligned EMG
 #   ens_top3            average of the 3 best by out-of-fold macro-F1
 #
 # Every result is also scored after per-person class-prior matching (each
@@ -106,6 +110,7 @@ CFG = {
         'full_lgbm', 'full_lgbm_sessz',
         'riemann_ts_lr', 'riemann_ts_lr_rc', 'riemann_mdm_rc', 'riemann_fbts_lr_rc',
         'cnn_raw', 'cnn_ea', 'cnn_rotaug',      # cnn_raw also yields cnn_raw_adabn
+        'auranet_like', 'auranet_like_ea',      # organisers' baseline design (EMG only)
     ],
     'SVM_MAX_TRAIN': 5000,                       # RBF-SVM subsample per fold
     'COV_SHRINK': 1e-3,
@@ -650,6 +655,33 @@ class SimpleEMGCNN(nn.Module):
         return self.fc(self.drop(torch.cat([h.mean(-1), h.amax(-1)], 1)))
 
 
+class EEGNetLike(nn.Module):
+    # AuraNet-style temporal-spatial CNN (the organisers' baseline design:
+    # time conv -> depthwise channel mix -> separable conv -> linear), i.e.
+    # EEGNet (Lawhern et al. 2018) adapted to 8 EMG channels at 200 Hz.
+    def __init__(self, n_ch, n_cls, F1=16, D=2, F2=32, k1=25, dropout=0.3):
+        super().__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(1, F1, (1, k1), padding=(0, k1 // 2), bias=False), nn.BatchNorm2d(F1),
+            nn.Conv2d(F1, F1 * D, (n_ch, 1), groups=F1, bias=False), nn.BatchNorm2d(F1 * D),
+            nn.ELU(), nn.AvgPool2d((1, 4)), nn.Dropout(dropout),
+            nn.Conv2d(F1 * D, F1 * D, (1, 15), padding=(0, 7), groups=F1 * D, bias=False),
+            nn.Conv2d(F1 * D, F2, 1, bias=False), nn.BatchNorm2d(F2),
+            nn.ELU(), nn.AvgPool2d((1, 8)), nn.Dropout(dropout))
+        with torch.no_grad():
+            n_flat = self.features(torch.zeros(1, 1, n_ch, WIN)).flatten(1).shape[1]
+        self.fc = nn.Linear(n_flat, n_cls)
+
+    def forward(self, x):
+        return self.fc(self.features(x.unsqueeze(1)).flatten(1))
+
+
+def make_model(arch, in_ch, n_cls):
+    if arch == 'eegnet':
+        return EEGNetLike(in_ch, n_cls, dropout=CFG['CNN_DROPOUT'])
+    return SimpleEMGCNN(in_ch, n_cls, CFG['CNN_WIDTH'], CFG['CNN_DROPOUT'])
+
+
 def cnn_augment(x, rot):
     B = x.shape[0]
     x = x.clone()
@@ -694,8 +726,8 @@ def cnn_proba_adabn(model, X, groups):
     return P
 
 
-def train_cnn(Xtr, ytr, Xva, yva, n_cls, rot=False, tag=''):
-    model = SimpleEMGCNN(Xtr.shape[1], n_cls, CFG['CNN_WIDTH'], CFG['CNN_DROPOUT']).to(device)
+def train_cnn(Xtr, ytr, Xva, yva, n_cls, rot=False, tag='', arch='cnn'):
+    model = make_model(arch, Xtr.shape[1], n_cls).to(device)
     cw = compute_class_weight('balanced', classes=np.arange(n_cls), y=ytr)
     ce = nn.CrossEntropyLoss(weight=torch.tensor(cw, dtype=torch.float32, device=device),
                              label_smoothing=CFG['LABEL_SMOOTHING'])
@@ -857,15 +889,15 @@ def algo_mdm_rc(f):
             mdm_proba(Ttr[f['tr']], D['y'][f['tr']], Tte, D['C']))
 
 
-def algo_cnn(rep, rot=False, adabn_name=None):
+def algo_cnn(rep, rot=False, adabn_name=None, arch='cnn', name=None):
     def run(f):
         A, B = D[rep]
-        name = 'cnn_rotaug' if rot else rep
+        nm = name or ('cnn_rotaug' if rot else rep)
         model = train_cnn(A[f['tr']], D['y'][f['tr']], A[f['va']], D['y'][f['va']],
-                          D['C'], rot=rot, tag=f'{name} fold {f["k"] + 1}')
+                          D['C'], rot=rot, tag=f'{nm} fold {f["k"] + 1}', arch=arch)
         Xho = torch.from_numpy(A[f['ho']]).to(device)
         Xte = torch.from_numpy(B).to(device)
-        out = {name: (cnn_proba(model, Xho), cnn_proba(model, Xte))}
+        out = {nm: (cnn_proba(model, Xho), cnn_proba(model, Xte))}
         if adabn_name:
             out[adabn_name] = (cnn_proba_adabn(model, Xho, D['sess'][f['ho']]),
                                cnn_proba_adabn(model, Xte, D['file_te']))
@@ -891,6 +923,9 @@ ALGOS = {
     'cnn_raw':            ('cnn_raw', algo_cnn('cnn_raw', adabn_name='cnn_raw_adabn')),
     'cnn_ea':             ('cnn_ea', algo_cnn('cnn_ea')),
     'cnn_rotaug':         ('cnn_raw', algo_cnn('cnn_raw', rot=True)),
+    'auranet_like':       ('emg_raw', algo_cnn('emg_raw', arch='eegnet', name='auranet_like',
+                                               adabn_name='auranet_like_adabn')),
+    'auranet_like_ea':    ('emg_ea', algo_cnn('emg_ea', arch='eegnet', name='auranet_like_ea')),
 }
 
 
@@ -900,7 +935,7 @@ def build_representations(needed, X_tr, X_te, sess_tr, ref_tr, file_te):
     t0 = time.time()
     if 'td4' in needed:
         D['td4'] = (hudgins_td4(X_tr), hudgins_td4(X_te))
-    if needed & {'td4_ea', 'cnn_ea'}:
+    if needed & {'td4_ea', 'cnn_ea', 'emg_ea'}:
         Xe_tr = euclidean_align(X_tr, sess_tr, ref_tr)
         Xe_te = euclidean_align(X_te, file_te, None)
         if 'td4_ea' in needed:
@@ -908,6 +943,9 @@ def build_representations(needed, X_tr, X_te, sess_tr, ref_tr, file_te):
         if 'cnn_ea' in needed:
             D['cnn_ea'] = (np.clip(Xe_tr[:, MODEL_CH], -CFG['CLIP_SIGNAL'], CFG['CLIP_SIGNAL']),
                            np.clip(Xe_te[:, MODEL_CH], -CFG['CLIP_SIGNAL'], CFG['CLIP_SIGNAL']))
+        if 'emg_ea' in needed:
+            D['emg_ea'] = (np.clip(Xe_tr[:, :N_EMG], -CFG['CLIP_SIGNAL'], CFG['CLIP_SIGNAL']),
+                           np.clip(Xe_te[:, :N_EMG], -CFG['CLIP_SIGNAL'], CFG['CLIP_SIGNAL']))
         del Xe_tr, Xe_te
     if 'tdpsd' in needed:
         D['tdpsd'] = (tdpsd(X_tr), tdpsd(X_te))
@@ -935,6 +973,8 @@ def build_representations(needed, X_tr, X_te, sess_tr, ref_tr, file_te):
         D['fbts_rc'] = (np.concatenate(parts_tr, 1), np.concatenate(parts_te, 1))
     if 'cnn_raw' in needed:
         D['cnn_raw'] = (X_tr[:, MODEL_CH], X_te[:, MODEL_CH])
+    if 'emg_raw' in needed:
+        D['emg_raw'] = (np.ascontiguousarray(X_tr[:, :N_EMG]), np.ascontiguousarray(X_te[:, :N_EMG]))
     print(f'  representations: {sorted(k for k in D if k not in ("y", "C", "sess", "file_te"))} '
           f'[{time.time() - t0:.0f}s]')
 
